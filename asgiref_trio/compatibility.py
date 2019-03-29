@@ -1,4 +1,3 @@
-import asyncio
 import inspect
 
 
@@ -18,10 +17,10 @@ def is_double_callable(application):
     if hasattr(application, "__call__"):
         # We only check to see if its __call__ is a coroutine function -
         # if it's not, it still might be a coroutine function itself.
-        if asyncio.iscoroutinefunction(application.__call__):
+        if inspect.iscoroutinefunction(application.__call__):
             return False
     # Non-classes we just check directly
-    return not asyncio.iscoroutinefunction(application)
+    return not inspect.iscoroutinefunction(application)
 
 
 def double_to_single_callable(application):

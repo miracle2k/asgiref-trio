@@ -1,4 +1,4 @@
-import asyncio
+import trio
 import functools
 import os
 import threading
@@ -8,6 +8,40 @@ try:
     import contextvars  # Python 3.7+ only.
 except ImportError:
     contextvars = None
+
+
+# https://gist.github.com/njsmith/be24d376faea61cb3999f08318b780f3
+class TrioExecutorHelper(trio.abc.AsyncResource):
+    def __init__(self, executor):
+        self._executor = executor
+        
+    async def run_sync(self, fn, *args):
+        fut = self._executor.submit(fn, *args)
+        
+        task = trio.hazmat.current_task()
+        token = trio.hazmat.current_trio_token()
+        def cb(_):
+            # If we successfully cancelled from cancel_fn, then
+            # this callback still gets called, but we were already
+            # rescheduled so we don't need to do it again.
+            if not fut.cancelled():
+                token.run_sync_soon(trio.hazmat.reschedule, task)
+        fut.add_done_callback(cb)
+        
+        def cancel_fn(_):
+            if fut.cancel():
+                return trio.hazmat.Abort.SUCCEEDED
+            else:
+                return trio.hazmat.Abort.FAILED
+        await trio.hazmat.wait_task_rescheduled(cancel_fn)
+        
+        assert fut.done()
+        return fut.result()
+                
+    async def aclose(self):
+        # shutdown() has no cancellation support, so we just have to wait it out
+        with trio.CancelScope(shield=True):
+            await trio.run_sync_in_worker_thread(self._executor.shutdown())
 
 
 class AsyncToSync:
@@ -21,50 +55,35 @@ class AsyncToSync:
     def __init__(self, awaitable):
         self.awaitable = awaitable
         try:
-            self.main_event_loop = asyncio.get_event_loop()
+            self.trio_portal = trio.BlockingTrioPortal()
         except RuntimeError:
             # There's no event loop in this thread. Look for the threadlocal if
             # we're inside SyncToAsync
-            self.main_event_loop = getattr(
-                SyncToAsync.threadlocal, "main_event_loop", None
+            self.trio_portal = getattr(
+                SyncToAsync.threadlocal, "trio_portal", None
             )
 
     def __call__(self, *args, **kwargs):
         # You can't call AsyncToSync from a thread with a running event loop
         try:
-            event_loop = asyncio.get_event_loop()
+            trio.hazmat.current_trio_token()
         except RuntimeError:
             pass
         else:
-            if event_loop.is_running():
-                raise RuntimeError(
-                    "You cannot use AsyncToSync in the same thread as an async event loop - "
-                    "just await the async function directly."
-                )
+            raise RuntimeError(
+                "You cannot use AsyncToSync in the same thread as an async event loop - "
+                "just await the async function directly."
+            )
+
         # Make a future for the return information
         call_result = Future()
+
         # Use call_soon_threadsafe to schedule a synchronous callback on the
         # main event loop's thread
-        if not (self.main_event_loop and self.main_event_loop.is_running()):
-            # Make our own event loop and run inside that.
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                loop.run_until_complete(self.main_wrap(args, kwargs, call_result))
-            finally:
-                try:
-                    if hasattr(loop, "shutdown_asyncgens"):
-                        loop.run_until_complete(loop.shutdown_asyncgens())
-                finally:
-                    loop.close()
-                    asyncio.set_event_loop(self.main_event_loop)
+        if not self.trio_portal:
+            return trio.run(functools.partial(self.awaitable, *args, **kwargs))
         else:
-            self.main_event_loop.call_soon_threadsafe(
-                self.main_event_loop.create_task,
-                self.main_wrap(args, kwargs, call_result),
-            )
-        # Wait for results from the future.
-        return call_result.result()
+            return self.trio_portal.run(functools.partial(self.awaitable, *args, **kwargs))
 
     def __get__(self, parent, objtype):
         """
@@ -90,14 +109,7 @@ class SyncToAsync:
     Utility class which turns a synchronous callable into an awaitable that
     runs in a threadpool. It also sets a threadlocal inside the thread so
     calls to AsyncToSync can escape it.
-    """
-
-    # If they've set ASGI_THREADS, update the default asyncio executor for now
-    if "ASGI_THREADS" in os.environ:
-        loop = asyncio.get_event_loop()
-        loop.set_default_executor(
-            ThreadPoolExecutor(max_workers=int(os.environ["ASGI_THREADS"]))
-        )
+    """    
 
     threadlocal = threading.local()
 
@@ -105,8 +117,6 @@ class SyncToAsync:
         self.func = func
 
     async def __call__(self, *args, **kwargs):
-        loop = asyncio.get_event_loop()
-
         if contextvars is not None:
             context = contextvars.copy_context()
             child = functools.partial(self.func, *args, **kwargs)
@@ -116,10 +126,10 @@ class SyncToAsync:
         else:
             func = self.func
 
-        future = loop.run_in_executor(
-            None, functools.partial(self.thread_handler, loop, func, *args, **kwargs)
+        portal = trio.BlockingTrioPortal()
+        return await SyncToAsync.executor.run_sync(
+            functools.partial(self.thread_handler, portal, func, *args, **kwargs)
         )
-        return await asyncio.wait_for(future, timeout=None)
 
     def __get__(self, parent, objtype):
         """
@@ -127,14 +137,17 @@ class SyncToAsync:
         """
         return functools.partial(self.__call__, parent)
 
-    def thread_handler(self, loop, func, *args, **kwargs):
+    def thread_handler(self, portal, func, *args, **kwargs):
         """
         Wraps the sync application with exception handling.
         """
         # Set the threadlocal for AsyncToSync
-        self.threadlocal.main_event_loop = loop
+        self.threadlocal.trio_portal = portal
         # Run the function
         return func(*args, **kwargs)
+
+
+SyncToAsync.executor = TrioExecutorHelper(ThreadPoolExecutor(max_workers=int(os.environ.get("ASGI_THREADS") or 1)))
 
 
 # Lowercase is more sensible for most things

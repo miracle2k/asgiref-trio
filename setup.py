@@ -1,6 +1,6 @@
 import os
 from setuptools import find_packages, setup
-from asgiref import __version__
+from asgiref_trio import __version__
 
 
 # We use the README as the long_description
@@ -8,7 +8,7 @@ readme_path = os.path.join(os.path.dirname(__file__), "README.rst")
 
 
 setup(
-    name='asgiref',
+    name='asgiref-trio',
     version=__version__,
     url='http://github.com/django/asgiref/',
     author='Django Software Foundation',
@@ -25,9 +25,7 @@ setup(
             "pytest-asyncio~=0.10.0",
         ],
     },
-    install_requires=[
-        'async_timeout>=2.0,<4.0',
-    ],
+    install_requires=[],
     classifiers=[
         'Development Status :: 5 - Production/Stable',
         'Environment :: Web Environment',
